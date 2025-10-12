@@ -1,11 +1,21 @@
-
+# UI Framework
 gradio
 
+# Offline LLM Runner
 llama-cpp-python>=0.2.19
 
+# Offline Embedding Model
 sentence-transformers
 
+# Vector Database
 chromadb
 
+# Document Parsers
 PyPDF2
 python-docx
+
+# Image Processing & AI Models
+torch
+transformers
+Pillow
+easyocr
