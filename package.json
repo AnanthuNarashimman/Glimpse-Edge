@@ -1,0 +1,15 @@
+{
+  "name": "glimpse-electron-project",
+  "version": "1.0.0",
+  "description": "Glimpse Offline RAG Application",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "author": "Your Name",
+  "license": "ISC",
+  "devDependencies": {
+    "electron": "^28.0.0"
+  }
+}
+

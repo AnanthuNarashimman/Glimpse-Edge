@@ -1,0 +1,11 @@
+
+gradio
+
+llama-cpp-python>=0.2.19
+
+sentence-transformers
+
+chromadb
+
+PyPDF2
+python-docx
