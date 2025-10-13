@@ -2,46 +2,35 @@
 const { app, BrowserWindow } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
+const http = require('http'); // Import the http module for pinging
 
 let pythonProcess = null;
+let mainWindow = null;
+
+// --- The Pinging Function ---
+// This function will repeatedly try to connect to the Gradio server.
+const checkGradioReady = (url, callback) => {
+  const tryConnect = () => {
+    http.get(url, (res) => {
+      // If we get a response (any response), the server is up!
+      if (res.statusCode >= 200 && res.statusCode < 400) {
+        console.log('Gradio server is ready!');
+        callback();
+      } else {
+        setTimeout(tryConnect, 1000); // Server is up but not ready, try again
+      }
+    }).on('error', () => {
+      // If the connection is refused, the server is not up yet.
+      console.log('Gradio not ready yet, retrying...');
+      setTimeout(tryConnect, 1000); // Retry every second
+    });
+  };
+  tryConnect();
+};
+
 
 function createMainWindow() {
-  console.log('Starting Python backend server...');
-
-  // --- FIX #1: Define the correct path to the Python executable ---
-  // This explicitly uses the Python from your virtual environment.
-  const pythonExecutable = process.platform === 'win32'
-    ? path.join(__dirname, 'backend', 'venv', 'Scripts', 'python.exe')
-    : path.join(__dirname, 'backend', 'venv', 'bin', 'python');
-  
-  const scriptPath = path.join(__dirname, 'backend', 'app.py');
-
-  // --- FIX #2: Set the correct working directory for the Python script ---
-  // The 'cwd' option tells the script to run *from within* the 'backend' folder.
-  // This is crucial for it to find the model file and other relative paths.
-  pythonProcess = spawn(pythonExecutable, [scriptPath], {
-    cwd: path.join(__dirname, 'backend') 
-  });
-
-  pythonProcess.stdout.on('data', (data) => {
-    console.log(`Python stdout: ${data}`);
-  });
-  pythonProcess.stderr.on('data', (data) => {
-    console.error(`Python stderr: ${data}`);
-  });
-  
-  pythonProcess.on('error', (error) => {
-    console.error(`Failed to start Python process: ${error.message}`);
-  });
-  
-  pythonProcess.on('exit', (code, signal) => {
-    console.log(`Python process exited with code ${code} and signal ${signal}`);
-    if (code !== 0 && code !== null) {
-      console.error('⚠️ Python backend crashed! Check the error messages above.');
-    }
-  });
-
-  const mainWindow = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 1280,
     height: 800,
     title: 'Glimpse',
@@ -51,33 +40,41 @@ function createMainWindow() {
     },
   });
 
-  const gradioUrl = 'http://127.0.0.1:7860';
+  mainWindow.loadURL(`data:text/html;charset=utf-8, <h1>Loading Glimpse AI Engine...</h1><p>This may take a moment. Please be patient.</p>`);
 
-  const loadUrlWithRetries = () => {
-    mainWindow.loadURL(gradioUrl)
-      .then(() => {
-        console.log('✅ Connection successful! Gradio UI loaded.');
-      })
-      .catch(() => {
-        console.log('⏳ Connection failed, retrying in 2 seconds...');
-        setTimeout(loadUrlWithRetries, 2000);
-      });
-  };
+  console.log('Starting Python backend server...');
   
-  setTimeout(loadUrlWithRetries, 5000);
+  const pythonExecutable = process.platform === 'win32'
+    ? path.join(__dirname, 'backend', 'venv', 'Scripts', 'python.exe')
+    : path.join(__dirname, 'backend', 'venv', 'bin', 'python');
+  
+  const scriptPath = path.join(__dirname, 'backend', 'app.py');
+
+  pythonProcess = spawn(pythonExecutable, ['-u', scriptPath], {
+    cwd: path.join(__dirname, 'backend')
+  });
+
+  pythonProcess.stdout.on('data', (data) => {
+    console.log(`Python stdout: ${data}`);
+  });
+  pythonProcess.stderr.on('data', (data) => {
+    console.error(`Python stderr: ${data}`);
+  });
+
+  // --- Use the new, robust checking method ---
+  checkGradioReady('http://127.0.0.1:7860', () => {
+    if (mainWindow) {
+      mainWindow.loadURL('http://127.0.0.1:7860');
+    }
+  });
 }
 
+// Standard Electron boilerplate...
 app.whenReady().then(createMainWindow);
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
-  }
-});
-
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    createMainWindow();
   }
 });
 
