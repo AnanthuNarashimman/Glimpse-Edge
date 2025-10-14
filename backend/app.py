@@ -6,269 +6,490 @@ import docx
 from sentence_transformers import SentenceTransformer
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from llama_cpp import Llama
+from PIL import Image
+from transformers import BlipProcessor, BlipForConditionalGeneration
+import sqlite3
+import re
+import vosk
+import json
+import wave
+import tempfile
+import subprocess
 
-# --- NEW: Import for OCR ---
-import easyocr
-
-# --- Force UTF-8 encoding to prevent Unicode errors ---
-import sys
-import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-
-# --- 1. INITIALIZE MODELS AND DATABASE ---
+# --- 1. INITIALIZE DATABASES & MODELS ---
 print("--- Initializing Glimpse Offline Backend ---")
 
-# --- LLM for Text Generation ---
+# --- SQLite Database for Brain Management ---
+DB_FILE = "brains.db"
+conn = sqlite3.connect(DB_FILE)
+cursor = conn.cursor()
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS brains (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        bio TEXT
+    )
+""")
+conn.commit()
+conn.close()
+print("Local SQLite DB for Brains initialized.")
+
+# --- AI Models (unchanged) ---
 MODEL_PATH = "./tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 try:
     LLM = Llama(model_path=MODEL_PATH, n_ctx=2048, n_threads=4, n_gpu_layers=0, verbose=False)
-    print("Local LLM loaded successfully.")
+    print("Local LLM loaded.")
 except Exception as e:
-    print(f"Error loading LLM: {e}")
     LLM = None
-
-# --- Model for Embeddings ---
 try:
     EMBEDDING_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
-    print("Local Embedding Model loaded successfully.")
-except Exception as e:
-    print(f"Error loading Embedding Model: {e}")
+    print("Local Embedding Model loaded.")
+except Exception:
     EMBEDDING_MODEL = None
-
-# --- NEW: Initialize the OCR Reader instead of the captioning model ---
 try:
-    print("Loading local OCR model... (This may download files on the first run)")
-    # This will download the OCR models for English the first time it's run.
-    # verbose=False suppresses the Unicode progress bar that causes encoding errors
-    OCR_READER = easyocr.Reader(['en'], verbose=False) 
-    print("Local OCR Model loaded successfully.")
+    IMAGE_PROCESSOR = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+    IMAGE_MODEL = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+    print("Local Image Captioning Model loaded.")
+except Exception:
+    IMAGE_MODEL = None
+
+# --- Vosk Speech Recognition ---
+VOSK_MODEL = None
+try:
+    VOSK_MODEL_PATH = "./vosk-model-en-us-0.22-lgraph"
+    if os.path.exists(VOSK_MODEL_PATH):
+        VOSK_MODEL = vosk.Model(VOSK_MODEL_PATH)
+        print("Vosk Speech Recognition Model loaded.")
+    else:
+        print("Vosk model not found. Voice input will be disabled.")
 except Exception as e:
-    print(f"Error loading OCR Model: {e}")
-    OCR_READER = None
+    print(f"Failed to load Vosk model: {e}")
+    VOSK_MODEL = None
 
 # --- Vector Database ---
 CHROMA_CLIENT = chromadb.PersistentClient(path="./chroma_db_offline")
-COLLECTION_NAME = "glimpse_offline_brain_multimodal"
-COLLECTION = CHROMA_CLIENT.get_or_create_collection(name=COLLECTION_NAME)
-print(f"ChromaDB ready. Collection '{COLLECTION_NAME}' has {COLLECTION.count()} items.")
+print("ChromaDB client ready.")
 
-# --- 2. CORE LOGIC FUNCTIONS ---
+# --- 2. CORE LOGIC & HELPER FUNCTIONS ---
 
-def _extract_text_from_document(file_path: str) -> str:
-    # This function for documents remains the same
+def get_brain_list():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name, bio FROM brains ORDER BY name")
+    brains = cursor.fetchall()
+    conn.close()
+    return brains
+
+def create_brain(name, bio):
+    if not name or not name.strip():
+        return "Error: Brain name cannot be empty.", get_brain_list()
+    sanitized_name = re.sub(r'[^a-zA-Z0-9_-]', '', name).lower()
+    if not sanitized_name:
+        return "Error: Invalid brain name.", get_brain_list()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO brains (name, bio) VALUES (?, ?)", (sanitized_name, bio))
+        conn.commit()
+        CHROMA_CLIENT.get_or_create_collection(name=sanitized_name)
+        message = f"Brain '{sanitized_name}' created."
+    except sqlite3.IntegrityError:
+        message = f"Error: Brain '{sanitized_name}' already exists."
+    finally:
+        conn.close()
+    return message, get_brain_list()
+
+def delete_brain(brain_name):
+    if not brain_name:
+        return "Error: No brain selected to delete.", get_brain_list()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM brains WHERE name = ?", (brain_name,))
+        conn.commit()
+        CHROMA_CLIENT.delete_collection(name=brain_name)
+        message = f"Brain '{brain_name}' deleted."
+    except Exception as e:
+        message = f"Error deleting brain: {e}"
+    finally:
+        conn.close()
+    return message, get_brain_list()
+
+def get_files_in_brain(brain_name):
+    """Gets a list of unique source filenames from a ChromaDB collection."""
+    if not brain_name: return "No Brain selected."
+    try:
+        collection = CHROMA_CLIENT.get_collection(name=brain_name)
+        metadata = collection.get(include=["metadatas"])['metadatas']
+        if not metadata: return "This Brain is empty."
+        unique_sources = sorted(list(set(item['source'] for item in metadata)))
+        return "\n".join(f"- {source}" for source in unique_sources)
+    except Exception:
+        return f"Brain '{brain_name}' not found or is empty."
+
+# --- File Processing (unchanged) ---
+def _extract_text_from_document(file_path):
     text = ""
     try:
         if file_path.endswith('.pdf'):
             with open(file_path, 'rb') as f:
                 reader = PyPDF2.PdfReader(f)
-                for page in reader.pages:
-                    text += page.extract_text() or ""
+                for page in reader.pages: text += page.extract_text() or ""
         elif file_path.endswith('.docx'):
             doc = docx.Document(file_path)
-            for para in doc.paragraphs:
-                text += para.text + "\n"
+            for para in doc.paragraphs: text += para.text + "\n"
         elif file_path.endswith('.txt'):
-            with open(file_path, 'r', encoding='utf-8') as f:
-                text = f.read()
+            with open(file_path, 'r', encoding='utf-8') as f: text = f.read()
         return text
-    except Exception as e:
-        print(f"Error extracting text from document {os.path.basename(file_path)}: {e}")
-        return ""
+    except Exception: return ""
 
-# --- MODIFIED: This function now uses OCR to READ text from images ---
-def _extract_text_from_image_ocr(image_path: str) -> str:
-    """Extracts text from an image file using EasyOCR."""
-    if not OCR_READER:
-        print("ERROR: OCR model not loaded. Skipping text extraction from image.")
-        return ""
-    
-    print(f"\n{'='*60}")
-    print(f"Starting OCR on image: {os.path.basename(image_path)}")
-    print(f"Full image path: {image_path}")
-    
+def _get_image_caption_offline(image_path):
+    if not IMAGE_MODEL: return ""
     try:
-        # Verify the image file exists and is accessible
-        if not os.path.exists(image_path):
-            print(f"ERROR: Image file does not exist: {image_path}")
-            return ""
-        
-        # Check file size
-        file_size = os.path.getsize(image_path)
-        print(f"Image file size: {file_size} bytes")
-        
-        if file_size == 0:
-            print(f"ERROR: Image file is empty (0 bytes)")
-            return ""
-        
-        # Try to load the image first to verify it's valid
-        try:
-            from PIL import Image
-            img = Image.open(image_path)
-            print(f"Image loaded successfully: {img.size} pixels, mode: {img.mode}")
-            img.close()
-        except Exception as img_err:
-            print(f"ERROR: Cannot open image file: {img_err}")
-            return ""
-        
-        print("Reading image with EasyOCR (this may take a moment)...")
-        
-        # Try with default settings first
-        result = OCR_READER.readtext(image_path, detail=1)  # detail=1 gives us confidence scores
-        
-        print(f"OCR raw result count: {len(result)}")
-        
-        if not result or len(result) == 0:
-            print(f"WARNING: OCR found no text in {os.path.basename(image_path)}")
-            print("This could mean:")
-            print("  1. The image contains no text")
-            print("  2. The text is too small or blurry")
-            print("  3. The text is in a language not supported")
-            print("  4. The image quality is too low")
-            return ""
-        
-        # Extract text and confidence scores
-        extracted_texts = []
-        for detection in result:
-            bbox, text, confidence = detection
-            print(f"  Detected: '{text}' (confidence: {confidence:.2f})")
-            # Only include text with reasonable confidence (>0.1)
-            if confidence > 0.1:
-                extracted_texts.append(text)
-        
-        if not extracted_texts:
-            print(f"WARNING: All detected text had too low confidence")
-            return ""
-        
-        # Join all text pieces
-        extracted_text = " ".join(extracted_texts)
-        
-        print(f"\nOCR SUCCESS:")
-        print(f"  - Extracted {len(extracted_texts)} text regions")
-        print(f"  - Total characters: {len(extracted_text)}")
-        print(f"  - Full text: {extracted_text}")
-        print(f"{'='*60}\n")
-        
-        return extracted_text
-        
-    except Exception as e:
-        print(f"ERROR processing image with OCR {os.path.basename(image_path)}: {e}")
-        import traceback
-        traceback.print_exc()
-        return ""
+        raw_image = Image.open(image_path).convert('RGB')
+        inputs = IMAGE_PROCESSOR(raw_image, return_tensors="pt")
+        out = IMAGE_MODEL.generate(**inputs, max_new_tokens=50)
+        return IMAGE_PROCESSOR.decode(out[0], skip_special_tokens=True)
+    except Exception: return ""
 
-# --- MODIFIED: The main ingestion function is now a smarter "traffic cop" ---
-def ingest_files(files):
-    if not files:
-        yield "No files uploaded. Please select files to process."
-        return
-    
-    total_files = len(files)
-    print(f"--- Starting ingestion for {total_files} files ---")
-    
-    doc_extensions = ['.pdf', '.docx', '.txt']
-    image_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.gif']
-    
+def ingest_files(files, brain_name, progress=gr.Progress()):
+    if not brain_name: return "Please select a Brain first.", ""
+    if not files: return "No files uploaded.", get_files_in_brain(brain_name)
+
+    collection = CHROMA_CLIENT.get_collection(name=brain_name)
     for i, file in enumerate(files):
-        status_message = f"Processing file {i + 1} of {total_files}: {os.path.basename(file.name)}..."
-        print(status_message)
-        yield status_message
-        
-        # Gradio's file object has the path in file.name
-        file_path = file.name
-        print(f"DEBUG: Full file path from Gradio: {file_path}")
-        print(f"DEBUG: File exists check: {os.path.exists(file_path)}")
-        
-        file_ext = os.path.splitext(file_path)[1].lower()
+        progress((i + 1) / len(files), desc=f"Processing: {os.path.basename(file.name)}")
+        file_ext = os.path.splitext(file.name)[1].lower()
         full_text = ""
+        if file_ext in ['.pdf', '.docx', '.txt']:
+            full_text = _extract_text_from_document(file.name)
+        elif file_ext in ['.png', '.jpg', '.jpeg']:
+            full_text = _get_image_caption_offline(file.name)
         
-        print(f"File extension detected: {file_ext}")
+        if not full_text.strip(): continue
         
-        if file_ext in doc_extensions:
-            print(f"Processing as DOCUMENT: {os.path.basename(file_path)}")
-            full_text = _extract_text_from_document(file_path)
-        elif file_ext in image_extensions:
-            print(f"Processing as IMAGE with OCR: {os.path.basename(file_path)}")
-            # --- THE FIX: Call the new OCR function for images ---
-            full_text = _extract_text_from_image_ocr(file_path)
-        else:
-            print(f"Skipping '{os.path.basename(file_path)}'. Unsupported file type.")
-            continue
-        
-        print(f"Extracted text length: {len(full_text)} characters")
-        print(f"Text preview: {full_text[:100] if full_text else 'EMPTY'}...")
-        
-        if not full_text or not full_text.strip():
-            print(f"ERROR: Skipping '{os.path.basename(file_path)}' due to empty content.")
-            continue
-        
-        print(f"Splitting text into chunks...")
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-        chunks = text_splitter.split_text(full_text)
-        print(f"Created {len(chunks)} chunks from the text")
-        
-        print(f"Generating embeddings for {len(chunks)} chunks...")
+        chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100).split_text(full_text)
         embeddings = EMBEDDING_MODEL.encode(chunks).tolist()
         ids = [f"{os.path.basename(file.name)}_{j}" for j in range(len(chunks))]
         metadatas = [{"source": os.path.basename(file.name)} for _ in chunks]
-        
-        print(f"Adding {len(chunks)} chunks to the knowledge base...")
-        COLLECTION.add(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
-        print(f"Successfully added {len(chunks)} chunks from {os.path.basename(file.name)}")
+        collection.add(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
     
-    final_message = f"Successfully processed {total_files} files. The Brain now contains a total of {COLLECTION.count()} knowledge chunks."
-    print(final_message)
-    yield final_message
+    status = f"Processed {len(files)} files. Brain '{brain_name}' now has {collection.count()} chunks."
+    return status, get_files_in_brain(brain_name)
 
-# The chat function remains the same
-def chat_with_docs(user_message, chat_history):
-    if COLLECTION.count() == 0:
+def chat_with_brain(user_message, chat_history, brain_name):
+    if not brain_name:
         chat_history.append({"role": "user", "content": user_message})
-        chat_history.append({"role": "assistant", "content": "The knowledge base is empty. Please upload some files first."})
+        chat_history.append({"role": "assistant", "content": "Please select a Brain to chat with from the 'Manage Brains' page."})
         return chat_history
-    
+        
+    collection = CHROMA_CLIENT.get_collection(name=brain_name)
     chat_history.append({"role": "user", "content": user_message})
     chat_history.append({"role": "assistant", "content": ""})
-
-    query_embedding = EMBEDDING_MODEL.encode(user_message).tolist()
-    results = COLLECTION.query(query_embeddings=[query_embedding], n_results=3)
     
-    if not results['documents'] or not results['documents'][0]:
-        chat_history[-1]["content"] = "I could not find any relevant information to answer that question."
+    # Query the vector database with metadata
+    results = collection.query(
+        query_embeddings=[EMBEDDING_MODEL.encode(user_message).tolist()], 
+        n_results=3,
+        include=["documents", "metadatas"]
+    )
+    
+    # Check if we have any relevant documents
+    if not results.get('documents') or not results['documents'][0] or collection.count() == 0:
+        # No documents in the brain or no relevant chunks found
+        chat_history[-1]["content"] = "❌ No information found in this brain. Please upload relevant documents first."
         yield chat_history
         return
-        
-    context = "\n\n".join(results['documents'][0])
-    prompt = f"Use the following context to answer the user's question. Context:\n{context}\n\nUser Question:\n{user_message}\n\nAnswer:"
     
-    output = LLM(prompt, max_tokens=512, stop=["User Question:"], stream=True)
+    # Extract context and sources
+    context = "\n\n".join(results['documents'][0])
+    sources = []
+    if results.get('metadatas') and results['metadatas'][0]:
+        seen_sources = set()
+        for metadata in results['metadatas'][0]:
+            source = metadata.get('source', 'Unknown')
+            if source not in seen_sources:
+                sources.append(source)
+                seen_sources.add(source)
+    
+    prompt = f"Context:\n{context}\n\nQuestion:\n{user_message}\n\nAnswer:"
+    output = LLM(prompt, max_tokens=512, stop=["Question:"], stream=True)
+    
+    # Stream the response
     for chunk in output:
         chat_history[-1]["content"] += chunk['choices'][0]['text']
         yield chat_history
+    
+    # Add citations after the response
+    if sources:
+        citation_text = "\n\n---\n**📚 Sources:**\n" + "\n".join([f"- {source}" for source in sources])
+        chat_history[-1]["content"] += citation_text
+        yield chat_history
 
-# --- 3. BUILD THE GRADIO UI ---
+def transcribe_audio(audio_path):
+    """
+    Convert audio file to text using Vosk with automatic format conversion.
+    """
+    if not VOSK_MODEL:
+        return "❌ Voice recognition is not available. Vosk model not loaded."
+    
+    if not audio_path:
+        return ""
+    
+    try:
+        import subprocess
+        import os
+        
+        # Create a temporary file for converted audio
+        temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        temp_wav_path = temp_wav.name
+        temp_wav.close()
+        
+        try:
+            # Convert audio to the required format using ffmpeg
+            # Gradio typically saves audio, but we need to ensure it's in the right format
+            subprocess.run([
+                'ffmpeg', '-y', '-i', audio_path,
+                '-ar', '16000',  # 16000 Hz sample rate
+                '-ac', '1',      # Mono
+                '-sample_fmt', 's16',  # 16-bit
+                temp_wav_path
+            ], check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            
+            audio_to_process = temp_wav_path
+            
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # FFmpeg not available, try to use the original file
+            audio_to_process = audio_path
+        
+        # Open the audio file
+        wf = wave.open(audio_to_process, "rb")
+        
+        # Check if format is acceptable
+        if wf.getnchannels() != 1:
+            wf.close()
+            if os.path.exists(temp_wav_path):
+                os.unlink(temp_wav_path)
+            return "❌ Audio must be mono. Please check your microphone settings."
+        
+        if wf.getframerate() not in [8000, 16000, 32000, 48000]:
+            wf.close()
+            if os.path.exists(temp_wav_path):
+                os.unlink(temp_wav_path)
+            return f"❌ Sample rate {wf.getframerate()} Hz not supported. Need 8000, 16000, 32000, or 48000 Hz."
+        
+        # Create recognizer
+        rec = vosk.KaldiRecognizer(VOSK_MODEL, wf.getframerate())
+        rec.SetWords(True)
+        
+        # Process audio
+        transcribed_text = ""
+        while True:
+            data = wf.readframes(4000)
+            if len(data) == 0:
+                break
+            if rec.AcceptWaveform(data):
+                result = json.loads(rec.Result())
+                transcribed_text += result.get("text", "") + " "
+        
+        # Get final result
+        final_result = json.loads(rec.FinalResult())
+        transcribed_text += final_result.get("text", "")
+        
+        wf.close()
+        
+        # Clean up temp file
+        if os.path.exists(temp_wav_path):
+            try:
+                os.unlink(temp_wav_path)
+            except:
+                pass
+        
+        return transcribed_text.strip() if transcribed_text.strip() else "❌ No speech detected. Please try again and speak clearly."
+        
+    except Exception as e:
+        return f"❌ Error processing audio: {str(e)}"
+
+# --- 3. BUILD THE GRADIO UI (TWO PAGES ONLY) ---
 with gr.Blocks(title="Glimpse", theme=gr.themes.Default(primary_hue="blue")) as demo:
     gr.Markdown("# Glimpse: Your Offline Intelligence Engine")
     
-    with gr.Tab("Ingest Knowledge"):
-        gr.Markdown("Upload your documents (.pdf, .docx, .txt) and images (.png, .jpg).")
-        file_input = gr.File(
-            label="Upload Files", 
-            file_count="multiple", 
-            file_types=[".pdf", ".docx", ".txt", ".png", ".jpg", ".jpeg"]
+    brain_list_state = gr.State(get_brain_list())
+
+    with gr.Tabs():
+        # === PAGE 1: BRAIN MANAGEMENT (NO REDIRECTS) ===
+        with gr.Tab("🧠 Manage Brains"):
+            gr.Markdown("## Create and Manage Your Knowledge Brains")
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("### Create New Brain")
+                    new_brain_name = gr.Textbox(label="Brain Name", placeholder="e.g., project-alpha")
+                    new_brain_bio = gr.Textbox(label="Description", placeholder="Brief description of this brain")
+                    create_brain_button = gr.Button("Create Brain", variant="primary")
+                    manage_status = gr.Textbox(label="Status", interactive=False)
+                
+                with gr.Column(scale=2):
+                    gr.Markdown("### Your Brains")
+                    brain_cards = gr.Dataset(
+                        components=[gr.Textbox(visible=False), gr.Textbox(visible=False)],
+                        headers=["Name", "Description"],
+                        samples=brain_list_state.value,
+                        label="All Brains"
+                    )
+                    with gr.Row():
+                        selected_brain_to_delete = gr.Textbox(label="Selected Brain", interactive=False)
+                        delete_brain_button = gr.Button("Delete Selected Brain", variant="stop")
+
+        # === PAGE 2: CHAT PAGE ===
+        with gr.Tab("💬 Chat"):
+            gr.Markdown("## Chat with Your Brain")
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("### Upload Documents")
+                    
+                    # Brain selector dropdown
+                    brain_selector = gr.Dropdown(
+                        label="Select Brain",
+                        choices=[b[0] for b in brain_list_state.value],
+                        interactive=True
+                    )
+                    
+                    # File upload area
+                    file_input = gr.File(
+                        label="Upload Files to Current Brain", 
+                        file_count="multiple", 
+                        file_types=[".pdf", ".docx", ".txt", ".png", ".jpg"]
+                    )
+                    ingest_button = gr.Button("Add to Brain", variant="primary")
+                    ingest_status = gr.Textbox(label="Upload Status", interactive=False)
+                    
+                    gr.Markdown("---")
+                    gr.Markdown("### Files in Brain")
+                    file_list = gr.Markdown("Select a brain to see files")
+
+                with gr.Column(scale=2):
+                    gr.Markdown("### Conversation")
+                    chatbot = gr.Chatbot(type="messages", height=500)
+                    
+                    msg_box = gr.Textbox(
+                        placeholder="Ask a question about the content in this brain...", 
+                        show_label=False,
+                        lines=1
+                    )
+                    
+                    with gr.Row():
+                        audio_input = gr.Audio(
+                            sources=["microphone"],
+                            type="filepath",
+                            label="🎤 Voice Input",
+                            show_label=True
+                        )
+                        clear_button = gr.ClearButton([msg_box, chatbot], value="Clear Chat")
+
+    # --- 4. WIRE UP THE LOGIC ---
+
+    # Task 1: Create Brain and clear input fields
+    def create_brain_and_clear(name, bio):
+        status, updated_list = create_brain(name, bio)
+        brain_names = [b[0] for b in updated_list]
+        return (
+            status,                                  # manage_status
+            updated_list,                            # brain_list_state
+            "",                                      # clear name field
+            "",                                      # clear bio field
+            gr.update(samples=updated_list),         # update brain_cards
+            gr.update(choices=brain_names)           # update brain_selector dropdown
         )
-        ingest_button = gr.Button("Process Files", variant="primary")
-        ingest_status = gr.Textbox(label="Status", interactive=False)
     
-    with gr.Tab("Chat with your Brain"):
-        gr.Markdown("Ask questions about the files you've uploaded.")
-        chatbot = gr.Chatbot(label="Conversation", type="messages")
-        msg_box = gr.Textbox(label="Your Question", placeholder="Ask about the content of your files...")
-        clear_button = gr.ClearButton([msg_box, chatbot])
+    create_brain_button.click(
+        fn=create_brain_and_clear,
+        inputs=[new_brain_name, new_brain_bio],
+        outputs=[manage_status, brain_list_state, new_brain_name, new_brain_bio, brain_cards, brain_selector]
+    )
+    
+    # Update brain dropdown and cards when brain list changes (for delete operations)
+    brain_list_state.change(
+        fn=lambda brains: (
+            gr.update(samples=brains),
+            gr.update(choices=[b[0] for b in brains])
+        ), 
+        inputs=brain_list_state, 
+        outputs=[brain_cards, brain_selector]
+    )
+    
+    # Select brain from cards (for deletion)
+    # Dataset.select automatically passes the selected row as a SelectData object
+    def handle_brain_selection(evt: gr.SelectData, brains_list):
+        """Extract brain name from selected row"""
+        if brains_list and evt.index < len(brains_list):
+            return brains_list[evt.index][0]
+        return ""
+    
+    brain_cards.select(
+        fn=handle_brain_selection,
+        inputs=[brain_list_state],
+        outputs=selected_brain_to_delete
+    )
+    
+    # Delete brain and update all components
+    def delete_brain_and_update(brain_name):
+        status, updated_list = delete_brain(brain_name)
+        brain_names = [b[0] for b in updated_list]
+        return (
+            status,                                  # manage_status
+            updated_list,                            # brain_list_state
+            "",                                      # clear selected_brain_to_delete
+            gr.update(samples=updated_list),         # update brain_cards
+            gr.update(choices=brain_names)           # update brain_selector dropdown
+        )
+    
+    delete_brain_button.click(
+        fn=delete_brain_and_update,
+        inputs=selected_brain_to_delete,
+        outputs=[manage_status, brain_list_state, selected_brain_to_delete, brain_cards, brain_selector]
+    )
+    
+    # Task 2: Update file list and clear chat when brain is selected in chat page
+    def switch_brain(brain_name):
+        files = get_files_in_brain(brain_name)
+        return files, [], ""  # Clear chatbot, clear status
+    
+    brain_selector.change(
+        fn=switch_brain,
+        inputs=brain_selector,
+        outputs=[file_list, chatbot, ingest_status]
+    )
+    
+    # Upload files to brain
+    ingest_button.click(
+        fn=ingest_files,
+        inputs=[file_input, brain_selector],
+        outputs=[ingest_status, file_list]
+    )
+    
+    # Voice input: transcribe audio and populate text box
+    audio_input.change(
+        fn=transcribe_audio,
+        inputs=audio_input,
+        outputs=msg_box
+    )
+    
+    # Task 3: Chat with brain and clear input box
+    def chat_and_clear(user_message, chat_history, brain_name):
+        # Generate response
+        for updated_history in chat_with_brain(user_message, chat_history, brain_name):
+            yield updated_history, ""  # Clear input box while streaming
+    
+    msg_box.submit(
+        fn=chat_and_clear,
+        inputs=[msg_box, chatbot, brain_selector],
+        outputs=[chatbot, msg_box]
+    )
 
-    ingest_button.click(ingest_files, inputs=[file_input], outputs=[ingest_status])
-    msg_box.submit(chat_with_docs, inputs=[msg_box, chatbot], outputs=[chatbot])
-
-# --- 4. LAUNCH THE APP ---
+# --- 6. LAUNCH THE APP ---
 if __name__ == "__main__":
     print("--- Launching Gradio UI ---")
     demo.launch(share=False, server_port=7860)
+

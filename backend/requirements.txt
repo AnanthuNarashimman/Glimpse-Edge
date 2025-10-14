@@ -19,3 +19,7 @@ torch
 transformers
 Pillow
 easyocr
+
+# Speech Recognition
+vosk
+pyaudio
