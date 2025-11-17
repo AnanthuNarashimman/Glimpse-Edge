@@ -1,4 +1,6 @@
 <div align="center">
+<img width="100%" height="136" alt="Glimpse" src="https://github.com/user-attachments/assets/17aeb27a-4006-4311-83ea-724eac290ed7" />
+
 
 # 🔍 Glimpse
 
